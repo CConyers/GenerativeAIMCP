@@ -1,0 +1,34 @@
+{
+  "name": "generativeaimcp",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "client:dev": "tsx client.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/google": "^1.2.19",
+    "@modelcontextprotocol/sdk": "^1.18.0",
+    "ai": "^4.3.16",
+    "dotenv": "^17.2.2",
+    "@inquirer/prompts": "^7.8.6"
+  },
+  "devDependencies": {
+    "@types/node": "^24.4.0",
+    "@typescript-eslint/eslint-plugin": "^8.44.0",
+    "@typescript-eslint/parser": "^8.44.0",
+    "eslint": "^9.35.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://CConyers: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@github.com/CConyers/GenerativeAIMCP.git"
+  },
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/CConyers/GenerativeAIMCP/issues"
+  },
+  "homepage": "https://github.com/CConyers/GenerativeAIMCP#readme"
+}
