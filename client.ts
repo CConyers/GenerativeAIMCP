@@ -11,6 +11,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js"
 import { generateText, jsonSchema, ToolSet } from "ai"
 
+import { MCP_RESULT_PROMPT } from "./constants"
+
 const serverConfigs = [
   {
     name: "Brave Search",
@@ -248,12 +250,33 @@ async function handleQuery(tools: Tool[], mcp: Client) {
       }),
       {} as ToolSet
     ),
-  })
+  }) as {
+    text: string;
+    toolResults?: Array<{
+      result?: {
+        content?: Array<{ text?: string }>;
+      };
+    }>;
+  }
 
-  console.log(
-    // @ts-expect-error
-    text || toolResults[0]?.result?.content[0]?.text || "No text generated."
-  )
+  // If Gemini already gave a full response, just print it
+  if (text) {
+    console.log(text)
+    return
+  }
+
+  // Otherwise, if toolResults exist, feed them back into Gemini
+  if (toolResults?.length) {
+    const output =
+      toolResults[0]?.result?.content?.[0]?.text || JSON.stringify(toolResults)
+
+    const { text: finalText } = await generateText({
+      model: google("gemini-2.0-flash"),
+      prompt: MCP_RESULT_PROMPT({ query, output}),
+    })
+
+    console.log(finalText || "No final text generated.")
+  }
 }
 
 async function handleTool(tool: Tool, mcp: Client) {
