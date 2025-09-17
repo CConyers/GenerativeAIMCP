@@ -25,12 +25,6 @@ const serverConfigs = [
     type: "stdio",
   },
   {
-    name: "Filesystem",
-    command: "npx",
-    args: ["-y", "@modelcontextprotocol/server-filesystem", "./"],
-    type: "stdio",
-  },
-  {
     name: "Alphavantage",
     url: `https://mcp.alphavantage.co/mcp?apikey=${process.env.ALPHAVANTAGE_API_KEY}`,
     type: "http",
