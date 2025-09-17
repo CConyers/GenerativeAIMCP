@@ -35,17 +35,25 @@ const google = createGoogleGenerativeAI({
 async function main() {
   await mcp.connect(transport)
 
-  const prompts: any[] = []
-  const resources: any[] = []
-  const resourceTemplates: any[] = []
-
-  const [{ tools }] =
-    await Promise.all([
-      mcp.listTools(),
-      // mcp.listPrompts(),
-      // mcp.listResources(),
-      // mcp.listResourceTemplates(),
-    ])
+  const tools = (await mcp.listTools()).tools
+  let prompts: any[] = []
+  let resources: any[] = []
+  let resourceTemplates: any[] = []
+  try {
+    prompts = (await mcp.listPrompts())?.prompts ?? []
+  } catch (e) {
+    prompts = []
+  }
+  try {
+    resources = (await mcp.listResources())?.resources ?? []
+  } catch (e) {
+    resources = []
+  }
+  try {
+    resourceTemplates = (await mcp.listResourceTemplates())?.resourceTemplates ?? []
+  } catch (e) {
+    resourceTemplates = []
+  }
 
   mcp.setRequestHandler(CreateMessageRequestSchema, async request => {
     const texts: string[] = []
