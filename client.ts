@@ -11,49 +11,85 @@ import {
 } from "@modelcontextprotocol/sdk/types.js"
 import { generateText, jsonSchema, ToolSet } from "ai"
 
-const mcp = new Client(
+const serverConfigs = [
   {
-    name: "text-client-video",
-    version: "1.0.0",
+    name: "Brave Search",
+    command: "npx",
+    args: ["-y", "@modelcontextprotocol/server-brave-search"],
+    env: {
+      BRAVE_API_KEY: process.env.BRAVE_API_KEY || "",
+    },
   },
-  { capabilities: { sampling: {} } }
-)
+  {
+    name: "Filesystem",
+    command: "npx",
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "./"],
+  },
+]
 
-const transport = new StdioClientTransport({
-  command: "npx",
-  args: ["-y", "@modelcontextprotocol/server-brave-search"],
-  env: {
-    BRAVE_API_KEY: process.env.BRAVE_API_KEY || "",
-  },
-  stderr: "ignore",
-})
+const clients: Record<string, Client> = {}
+const transports: Record<string, StdioClientTransport> = {}
 
 const google = createGoogleGenerativeAI({
   apiKey: process.env.GEMINI_API_KEY,
 })
 
 async function main() {
-  await mcp.connect(transport)
+  // Connect to all servers
+  for (const config of serverConfigs) {
+    const client = new Client(
+      {
+        name: config.name,
+        version: "1.0.0",
+      },
+      { capabilities: { sampling: {} } }
+    )
+    const transport = new StdioClientTransport({
+      command: config.command,
+      args: config.args,
+      env: config.env,
+      stderr: "ignore",
+    })
+    await client.connect(transport)
+    clients[config.name] = client
+    transports[config.name] = transport
+  }
 
-  const tools = (await mcp.listTools()).tools
+  // Select which server to use
+  let selectedServer = await select({
+    message: "Select MCP server",
+    choices: [
+      { name: "Query All Servers", value: "__query_all__" },
+      ...serverConfigs.map(cfg => ({ name: cfg.name, value: cfg.name })),
+    ],
+  })
+  // Always set mcp to a valid client (default to first client if needed)
+  let mcp: Client = selectedServer === "__query_all__"
+    ? clients[Object.keys(clients)[0]]
+    : clients[selectedServer]
+  // (removed duplicate declaration of mcp)
+
+  let tools: any[] = []
   let prompts: any[] = []
   let resources: any[] = []
   let resourceTemplates: any[] = []
-  try {
-    prompts = (await mcp.listPrompts())?.prompts ?? []
-  } catch (e) {
-    prompts = []
+
+  async function refreshServerData() {
+    try {
+      tools = (await mcp.listTools()).tools
+    } catch { tools = [] }
+    try {
+      prompts = (await mcp.listPrompts())?.prompts ?? []
+    } catch { prompts = [] }
+    try {
+      resources = (await mcp.listResources())?.resources ?? []
+    } catch { resources = [] }
+    try {
+      resourceTemplates = (await mcp.listResourceTemplates())?.resourceTemplates ?? []
+    } catch { resourceTemplates = [] }
   }
-  try {
-    resources = (await mcp.listResources())?.resources ?? []
-  } catch (e) {
-    resources = []
-  }
-  try {
-    resourceTemplates = (await mcp.listResourceTemplates())?.resourceTemplates ?? []
-  } catch (e) {
-    resourceTemplates = []
-  }
+
+  await refreshServerData()
 
   mcp.setRequestHandler(CreateMessageRequestSchema, async request => {
     const texts: string[] = []
@@ -75,13 +111,55 @@ async function main() {
 
   console.log("You are connected!")
   while (true) {
+  const menuChoices = ["Query"]
+  if (tools.length > 0) menuChoices.push("Tools")
+  if (resources.length > 0 || resourceTemplates.length > 0) menuChoices.push("Resources")
+  if (prompts.length > 0) menuChoices.push("Prompts")
+  menuChoices.push("Switch Server")
     const option = await select({
-      message: "What would you like to do",
-      choices: ["Query", "Tools"],
+      message: `What would you like to do (Server: ${selectedServer})`,
+      choices: menuChoices,
     })
 
-    switch (option) {
+  switch (option) {
+      case "Query All Servers":
+        // Aggregate all tools from all clients
+        let allTools: Tool[] = []
+        for (const clientName of Object.keys(clients)) {
+          try {
+            const clientTools = (await clients[clientName].listTools()).tools
+            allTools = allTools.concat(clientTools)
+          } catch {}
+        }
+        await handleQuery(allTools, mcp)
+        break
+      case "Switch Server":
+        selectedServer = await select({
+          message: "Select MCP server",
+          choices: [
+            { name: "Query All Servers", value: "__query_all__" },
+            ...serverConfigs.map(cfg => ({ name: cfg.name, value: cfg.name })),
+          ],
+        })
+        if (selectedServer === "__query_all__") {
+          // Aggregate all tools from all clients
+          let allTools: Tool[] = []
+          for (const clientName of Object.keys(clients)) {
+            try {
+              const clientTools = (await clients[clientName].listTools()).tools
+              allTools = allTools.concat(clientTools)
+            } catch {}
+          }
+          // Use the first available client for tool execution context
+          const firstClient = clients[Object.keys(clients)[0]]
+          await handleQuery(allTools, firstClient)
+        } else {
+          mcp = clients[selectedServer]
+          await refreshServerData()
+        }
+        break
       case "Tools":
+        if (!mcp) break;
         const toolName = await select({
           message: "Select a tool",
           choices: tools.map(tool => ({
@@ -94,10 +172,11 @@ async function main() {
         if (tool == null) {
           console.error("Tool not found.")
         } else {
-          await handleTool(tool)
+          await handleTool(tool, mcp)
         }
         break
       case "Resources":
+        if (!mcp) break;
         const resourceUri = await select({
           message: "Select a resource",
           choices: [
@@ -120,10 +199,11 @@ async function main() {
         if (uri == null) {
           console.error("Resource not found.")
         } else {
-          await handleResource(uri)
+          await handleResource(uri, mcp)
         }
         break
       case "Prompts":
+        if (!mcp) break;
         const promptName = await select({
           message: "Select a prompt",
           choices: prompts.map(prompt => ({
@@ -136,16 +216,17 @@ async function main() {
         if (prompt == null) {
           console.error("Prompt not found.")
         } else {
-          await handlePrompt(prompt)
+          await handlePrompt(prompt, mcp)
         }
         break
       case "Query":
-        await handleQuery(tools)
+        if (!mcp) break;
+        await handleQuery(tools, mcp)
     }
   }
 }
 
-async function handleQuery(tools: Tool[]) {
+async function handleQuery(tools: Tool[], mcp: Client) {
   const query = await input({ message: "Enter your query" })
 
   const { text, toolResults } = await generateText({
@@ -156,7 +237,7 @@ async function handleQuery(tools: Tool[]) {
         ...obj,
         [tool.name]: {
           description: tool.description,
-          parameters: jsonSchema(tool.inputSchema),
+          parameters: jsonSchema(tool.inputSchema as any),
           execute: async (args: Record<string, any>) => {
             return await mcp.callTool({
               name: tool.name,
@@ -175,7 +256,7 @@ async function handleQuery(tools: Tool[]) {
   )
 }
 
-async function handleTool(tool: Tool) {
+async function handleTool(tool: Tool, mcp: Client) {
   const args: Record<string, string> = {}
   for (const [key, value] of Object.entries(
     tool.inputSchema.properties ?? {}
@@ -193,7 +274,7 @@ async function handleTool(tool: Tool) {
   console.log((res.content as [{ text: string }])[0].text)
 }
 
-async function handleResource(uri: string) {
+async function handleResource(uri: string, mcp: Client) {
   let finalUri = uri
   const paramMatches = uri.match(/{([^}]+)}/g)
 
@@ -216,7 +297,7 @@ async function handleResource(uri: string) {
   )
 }
 
-async function handlePrompt(prompt: Prompt) {
+async function handlePrompt(prompt: Prompt, mcp: Client) {
   const args: Record<string, string> = {}
   for (const arg of prompt.arguments ?? []) {
     args[arg.name] = await input({
