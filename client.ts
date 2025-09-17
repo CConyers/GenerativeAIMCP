@@ -3,6 +3,7 @@ import { createGoogleGenerativeAI } from "@ai-sdk/google"
 import { confirm, input, select } from "@inquirer/prompts"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import {
   CreateMessageRequestSchema,
   Prompt,
@@ -21,16 +22,23 @@ const serverConfigs = [
     env: {
       BRAVE_API_KEY: process.env.BRAVE_API_KEY || "",
     },
+    type: "stdio",
   },
   {
     name: "Filesystem",
     command: "npx",
     args: ["-y", "@modelcontextprotocol/server-filesystem", "./"],
+    type: "stdio",
   },
+  {
+    name: "Alphavantage",
+    url: `https://mcp.alphavantage.co/mcp?apikey=${process.env.ALPHAVANTAGE_API_KEY}`,
+    type: "http",
+  }
 ]
 
 const clients: Record<string, Client> = {}
-const transports: Record<string, StdioClientTransport> = {}
+const transports: Record<string, StdioClientTransport | StreamableHTTPClientTransport> = {}
 
 const google = createGoogleGenerativeAI({
   apiKey: process.env.GEMINI_API_KEY,
@@ -46,12 +54,22 @@ async function main() {
       },
       { capabilities: { sampling: {} } }
     )
-    const transport = new StdioClientTransport({
-      command: config.command,
-      args: config.args,
-      env: config.env,
-      stderr: "ignore",
-    })
+    let transport: StdioClientTransport | StreamableHTTPClientTransport | undefined
+    if (config.type === "stdio") {
+        transport = new StdioClientTransport({
+          command: config.command ?? "",
+          args: config.args,
+          env: config.env,
+          stderr: "ignore",
+        })
+    } else if (config.type === "http") {
+        transport = new StreamableHTTPClientTransport(
+          new URL(config.url!)
+        )
+    } else {
+        throw new Error(`Unknown transport type: ${config.type}`)
+    }
+
     await client.connect(transport)
     clients[config.name] = client
     transports[config.name] = transport
@@ -77,9 +95,21 @@ async function main() {
   let resourceTemplates: any[] = []
 
   async function refreshServerData() {
-    try {
-      tools = (await mcp.listTools()).tools
-    } catch { tools = [] }
+    if (selectedServer === "__query_all__") {
+      // Aggregate all tools from all clients
+      let allTools: Tool[] = []
+      for (const clientName of Object.keys(clients)) {
+        try {
+          const clientTools = (await clients[clientName].listTools()).tools
+          allTools = allTools.concat(clientTools)
+        } catch {}
+      }
+      tools = allTools
+    } else {
+      try {
+        tools = (await mcp.listTools()).tools
+      } catch { tools = [] }
+    }
     try {
       prompts = (await mcp.listPrompts())?.prompts ?? []
     } catch { prompts = [] }
@@ -123,18 +153,9 @@ async function main() {
       choices: menuChoices,
     })
 
+
+
   switch (option) {
-      case "Query All Servers":
-        // Aggregate all tools from all clients
-        let allTools: Tool[] = []
-        for (const clientName of Object.keys(clients)) {
-          try {
-            const clientTools = (await clients[clientName].listTools()).tools
-            allTools = allTools.concat(clientTools)
-          } catch {}
-        }
-        await handleQuery(allTools, mcp)
-        break
       case "Switch Server":
         selectedServer = await select({
           message: "Select MCP server",
@@ -144,17 +165,19 @@ async function main() {
           ],
         })
         if (selectedServer === "__query_all__") {
-          // Aggregate all tools from all clients
+          // Aggregate all tools and map to their MCPs
           let allTools: Tool[] = []
+          const toolClientMap: Record<string, Client> = {}
           for (const clientName of Object.keys(clients)) {
             try {
               const clientTools = (await clients[clientName].listTools()).tools
-              allTools = allTools.concat(clientTools)
+              for (const tool of clientTools) {
+                allTools.push(tool)
+                toolClientMap[tool.name] = clients[clientName]
+              }
             } catch {}
           }
-          // Use the first available client for tool execution context
-          const firstClient = clients[Object.keys(clients)[0]]
-          await handleQuery(allTools, firstClient)
+          await handleQueryAllServers(allTools, toolClientMap)
         } else {
           mcp = clients[selectedServer]
           await refreshServerData()
@@ -222,9 +245,79 @@ async function main() {
         }
         break
       case "Query":
-        if (!mcp) break;
-        await handleQuery(tools, mcp)
+        if (selectedServer === "__query_all__") {
+          // Aggregate all tools and map to their MCPs
+          let allTools: Tool[] = []
+          const toolClientMap: Record<string, Client> = {}
+          for (const clientName of Object.keys(clients)) {
+            try {
+              const clientTools = (await clients[clientName].listTools()).tools
+              for (const tool of clientTools) {
+                allTools.push(tool)
+                toolClientMap[tool.name] = clients[clientName]
+              }
+            } catch {}
+          }
+          await handleQueryAllServers(allTools, toolClientMap)
+        } else {
+          if (!mcp) break;
+          console.log('tools :>> ', tools);
+          await handleQuery(tools, mcp)
+        }
     }
+  }
+}
+
+// Query All Servers handler: uses correct client for each tool
+async function handleQueryAllServers(tools: Tool[], toolClientMap: Record<string, Client>) {
+  const query = await input({ message: "Enter your query" })
+
+  const { text, toolResults } = await generateText({
+    model: google("gemini-2.0-flash"),
+    prompt: query,
+    tools: tools.reduce(
+      (obj, tool) => ({
+        ...obj,
+        [tool.name]: {
+          description: tool.description,
+          parameters: jsonSchema(tool.inputSchema as any),
+          execute: async (args: Record<string, any>) => {
+            const mcp = toolClientMap[tool.name]
+            return await mcp.callTool({
+              name: tool.name,
+              arguments: args,
+            })
+          },
+        },
+      }),
+      {} as ToolSet
+    ),
+  }) as {
+    text: string;
+    toolResults?: Array<{
+      result?: {
+        content?: Array<{ text?: string }>;
+      };
+    }>;
+  }
+
+  // If Gemini already gave a full response, just print it
+  if (text) {
+    console.log(text)
+    return
+  }
+
+  // Otherwise, if toolResults exist, feed them back into Gemini
+  if (toolResults?.length) {
+    const output =
+      toolResults[0]?.result?.content?.[0]?.text || JSON.stringify(toolResults)
+
+    const { text: finalText } = await generateText({
+      model: google("gemini-2.0-flash"),
+      prompt: MCP_RESULT_PROMPT({ query, output }),
+    })
+
+    console.log(finalText || "No final text generated.")
   }
 }
 
