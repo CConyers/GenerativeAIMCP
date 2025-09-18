@@ -43,7 +43,9 @@ Any other relevant info
 ## 📋 Usage
 
 ```bash
-npm run client:dev
+npm run client:dev   - Runs client in dev mode with extra logging and direct tool access  
+npm run client       - Runs client in standard mode  
+npm run research     - Generates research output with prettier formatting, extra prompts, citations, and Word export
 ```
 
 Select from available options:
