@@ -12,7 +12,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js"
 import { generateText, jsonSchema, ToolSet, tool } from "ai"
 
-import { MCP_RESULT_PROMPT } from "./constants.js"
+import { GOOGLE_MODEL, MCP_RESULT_PROMPT } from "./constants.js"
+import {createSpinner} from "./helper.js"
 import { chartTools } from "./chart-tools.js"
 
 const serverConfigs = [
@@ -349,14 +350,14 @@ async function handleServerMessagePrompt(message: PromptMessage) {
   if (!run) return
 
   const { text } = await generateText({
-    model: google("gemini-2.0-flash"),
+    model: google(GOOGLE_MODEL),
     prompt: message.content.text,
   })
 
   return text
 }
 
-// Unified interactive query loop (multi or single server). Keeps asking clarifications until final answer.
+// Unified interactive query loop (multi or single server). Uses recursive approach for conversation flow.
 async function handleInteractiveQuery(tools: Tool[], opts: { multi: boolean; toolClientMap?: Record<string, Client>; mcp?: Client }) {
   const { multi, toolClientMap, mcp } = opts;
   let userQuery = await input({ message: 'Enter your query' });
@@ -398,17 +399,15 @@ async function handleInteractiveQuery(tools: Tool[], opts: { multi: boolean; too
     return mcpTools;
   };
 
-  while (true) {
-    // Show loading spinner while waiting for response
-    const spinnerChars = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    let spinnerIndex = 0;
-    process.stdout.write('  Generating response... ');
-    const spinnerInterval = setInterval(() => {
-      process.stdout.write(`\r${spinnerChars[spinnerIndex]} Generating response...`);
-      spinnerIndex = (spinnerIndex + 1) % spinnerChars.length;
-    }, 100);
+  // Recursive function to process conversation steps
+  async function processConversation(currentTranscript: string): Promise<void> {
+    const spinner = createSpinner('Generating response...');
 
-    const { text, toolResults } = await generateText({ model: google('gemini-2.0-flash'), prompt: transcript, tools: buildToolSet() }) as { 
+    const { text, toolResults } = await generateText({ 
+      model: google(GOOGLE_MODEL), 
+      prompt: currentTranscript, 
+      tools: buildToolSet() 
+    }) as { 
       text: string; 
       toolResults?: Array<{
         toolName?: string;
@@ -418,11 +417,9 @@ async function handleInteractiveQuery(tools: Tool[], opts: { multi: boolean; too
       }>;
     };
     
-    // Clear spinner
-    clearInterval(spinnerInterval);
-    process.stdout.write('\r' + ' '.repeat(30) + '\r'); // Clear the line
+    spinner.stop();
     
-    // Log any tools that were called
+    // Handle tool results and loop detection
     if (toolResults && toolResults.length > 0) {
       console.log('toolResults :>> ', toolResults);
       const calledToolNames = toolResults
@@ -436,11 +433,10 @@ async function handleInteractiveQuery(tools: Tool[], opts: { multi: boolean; too
         consecutiveToolCalls++;
         if (consecutiveToolCalls >= MAX_CONSECUTIVE_TOOL_CALLS) {
           console.log(`⚠️  Detected ${consecutiveToolCalls} consecutive identical tool calls. Forcing final response...`);
-          // Force a final response without more tool calls
           const output = toolResults[0]?.result?.content?.[0]?.text || JSON.stringify(toolResults);
           const { text: forcedText } = await generateText({
-            model: google('gemini-2.0-flash'),
-            prompt: `${transcript}\n\nBased on the tool results above, provide a comprehensive final answer. Do not call any more tools.`,
+            model: google(GOOGLE_MODEL),
+            prompt: `${currentTranscript}\n\nTool Results: ${output}\n\nBased on the tool results above, provide a comprehensive final answer. Do not call any more tools.`,
           });
           if (forcedText) {
             console.log(forcedText);
@@ -459,58 +455,73 @@ async function handleInteractiveQuery(tools: Tool[], opts: { multi: boolean; too
       const output = toolResults[0]?.result?.content?.[0]?.text || JSON.stringify(toolResults);
       
       const { text: finalText } = await generateText({
-        model: google('gemini-2.0-flash'),
-        prompt: MCP_RESULT_PROMPT({ query: transcript, output }),
+        model: google(GOOGLE_MODEL),
+        prompt: MCP_RESULT_PROMPT({ query: currentTranscript, output }),
         tools: buildToolSet()
       });
       
       if (finalText) {
         console.log(finalText);
-        transcript += `\nAssistant: ${finalText}`;
+        const newTranscript = currentTranscript + `\nAssistant: ${finalText}`;
+        
         // Check if this final response is a clarification
         if (isClarification(finalText.trim())) {
           const answer = await input({ message: finalText.trim() + ' (/stop to cancel, /run to force answer)' });
-          if (answer.toLowerCase() === '/stop') { console.log('--- Conversation aborted ---'); return; }
-          transcript += `\nUser: ${answer}`;
-          if (answer.toLowerCase() === '/run') {
-            transcript += '\nAssistant: Provide the best possible final answer now.';
+          if (answer.toLowerCase() === '/stop') { 
+            console.log('--- Conversation aborted ---'); 
+            return; 
           }
-          continue;
+          const updatedTranscript = newTranscript + `\nUser: ${answer}`;
+          if (answer.toLowerCase() === '/run') {
+            return processConversation(updatedTranscript + '\nAssistant: Provide the best possible final answer now.');
+          }
+          return processConversation(updatedTranscript);
         }
+        
         // Check if response is too short
         if (isTooShort(finalText.trim())) {
-          transcript += '\nUser: (auto) Please elaborate fully with data, context, and actionable insights.';
-          continue;
+          return processConversation(newTranscript + '\nUser: (auto) Please elaborate fully with data, context, and actionable insights.');
         }
+        
         console.log('--- End of conversation ---');
         return;
       }
     }
     
+    // Handle case where there's no text at all
     if (!text) {
-      transcript += '\nAssistant: Please provide the final comprehensive answer now.';
-      continue;
+      return processConversation(currentTranscript + '\nAssistant: Please provide the final comprehensive answer now.');
     }
+    
+    // Handle normal text response
     const reply = text.trim();
     console.log(reply);
+    
     if (isClarification(reply)) {
       const answer = await input({ message: reply + ' (/stop to cancel, /run to force answer)' });
-      if (answer.toLowerCase() === '/stop') { console.log('--- Conversation aborted ---'); return; }
-      transcript += `\nAssistant: ${reply}\nUser: ${answer}`;
-      if (answer.toLowerCase() === '/run') {
-        transcript += '\nAssistant: Provide the best possible final answer now.';
+      if (answer.toLowerCase() === '/stop') { 
+        console.log('--- Conversation aborted ---'); 
+        return; 
       }
-      continue;
+      const newTranscript = currentTranscript + `\nAssistant: ${reply}\nUser: ${answer}`;
+      if (answer.toLowerCase() === '/run') {
+        return processConversation(newTranscript + '\nAssistant: Provide the best possible final answer now.');
+      }
+      return processConversation(newTranscript);
     }
+    
     // Non-clarification -> decide if we should force elaboration
     if (isTooShort(reply)) {
-      transcript += `\nAssistant: ${reply}`;
-      transcript += '\nUser: (auto) Please elaborate fully with data, context, and actionable insights.';
-      continue;
+      const newTranscript = currentTranscript + `\nAssistant: ${reply}` + '\nUser: (auto) Please elaborate fully with data, context, and actionable insights.';
+      return processConversation(newTranscript);
     }
+    
     console.log('--- End of conversation ---');
     return;
   }
+
+  // Start the recursive conversation
+  await processConversation(transcript);
 }
 
 main()
