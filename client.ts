@@ -11,27 +11,12 @@ import {
   Tool,
 } from "@modelcontextprotocol/sdk/types.js"
 import { generateText, jsonSchema, ToolSet, tool } from "ai"
+import ora from "ora"
+import chalk from "chalk"
 
-import { GOOGLE_MODEL, MCP_RESULT_PROMPT } from "./constants.js"
-import {createSpinner} from "./helper.js"
+import { GOOGLE_MODEL, MCP_RESULT_PROMPT, SERVER_CONFIGS } from "./constants.js"
 import { chartTools } from "./chart-tools.js"
-
-const serverConfigs = [
-  {
-    name: "Brave Search",
-    command: "npx",
-    args: ["-y", "@modelcontextprotocol/server-brave-search"],
-    env: {
-      BRAVE_API_KEY: process.env.BRAVE_API_KEY || "",
-    },
-    type: "stdio",
-  },
-  {
-    name: "Alphavantage",
-    url: `https://mcp.alphavantage.co/mcp?apikey=${process.env.ALPHAVANTAGE_API_KEY}`,
-    type: "http",
-  },
-]
+import { aggregateAllTools, aggregateToolsWithMapping } from "./helpers.js"
 
 const clients: Record<string, Client> = {}
 const transports: Record<string, StdioClientTransport | StreamableHTTPClientTransport> = {}
@@ -42,7 +27,7 @@ const google = createGoogleGenerativeAI({
 
 async function main() {
   // Connect to all servers
-  for (const config of serverConfigs) {
+  for (const config of SERVER_CONFIGS) {
     const client = new Client(
       {
         name: config.name,
@@ -75,15 +60,14 @@ async function main() {
   let selectedServer = await select({
     message: "Select MCP server",
     choices: [
-      { name: "Query All Servers", value: "__query_all__" },
-      ...serverConfigs.map(cfg => ({ name: cfg.name, value: cfg.name })),
+      { name: "Query All Servers", value: "All Servers" },
+      ...SERVER_CONFIGS.map(cfg => ({ name: cfg.name, value: cfg.name })),
     ],
   })
   // Always set mcp to a valid client (default to first client if needed)
-  let mcp: Client = selectedServer === "__query_all__"
+  let mcp: Client = selectedServer === "All Servers"
     ? clients[Object.keys(clients)[0]]
     : clients[selectedServer]
-  // (removed duplicate declaration of mcp)
 
   let tools: any[] = []
   let prompts: any[] = []
@@ -91,26 +75,8 @@ async function main() {
   let resourceTemplates: any[] = []
 
   async function refreshServerData() {
-    if (selectedServer === "__query_all__") {
-      // Aggregate all tools from all clients
-      let allTools: Tool[] = []
-      for (const clientName of Object.keys(clients)) {
-        try {
-          const clientTools = (await clients[clientName].listTools()).tools
-          allTools = allTools.concat(clientTools)
-        } catch {}
-      }
-
-      // Add chart tools to the tools array so they're available regardless of server selection
-      const chartToolsAsTools = Object.entries(chartTools).map(([name, tool]) => ({
-        name,
-        description: tool.description,
-        inputSchema: tool.parameters as any,
-        annotations: { title: name.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) }
-      }));
-      allTools.push(...chartToolsAsTools);
-
-      tools = allTools
+    if (selectedServer === "All Servers") {
+      tools = await aggregateAllTools(clients);
     } else {
       try {
         tools = (await mcp.listTools()).tools
@@ -149,10 +115,12 @@ async function main() {
 
   console.log("You are connected!")
   while (true) {
+
   const menuChoices = ["Query"]
   if (tools.length > 0) menuChoices.push("Tools")
   if (resources.length > 0 || resourceTemplates.length > 0) menuChoices.push("Resources")
   if (prompts.length > 0) menuChoices.push("Prompts")
+
   menuChoices.push("Switch Server")
     const option = await select({
       message: `What would you like to do (Server: ${selectedServer})`,
@@ -164,23 +132,12 @@ async function main() {
         selectedServer = await select({
           message: "Select MCP server",
           choices: [
-            { name: "Query All Servers", value: "__query_all__" },
-            ...serverConfigs.map(cfg => ({ name: cfg.name, value: cfg.name })),
+            { name: "Query All Servers", value: "All Servers" },
+            ...SERVER_CONFIGS.map(cfg => ({ name: cfg.name, value: cfg.name })),
           ],
         })
-        if (selectedServer === "__query_all__") {
-          // Aggregate all tools and map to their MCPs
-          let allTools: Tool[] = []
-          const toolClientMap: Record<string, Client> = {}
-          for (const clientName of Object.keys(clients)) {
-            try {
-              const clientTools = (await clients[clientName].listTools()).tools
-              for (const tool of clientTools) {
-                allTools.push(tool)
-                toolClientMap[tool.name] = clients[clientName]
-              }
-            } catch {}
-          }
+        if (selectedServer === "All Servers") {
+          const { allTools, toolClientMap } = await aggregateToolsWithMapping(clients);
           await handleInteractiveQuery(allTools, { multi: true, toolClientMap })
         } else {
           mcp = clients[selectedServer]
@@ -249,27 +206,8 @@ async function main() {
         }
         break
       case "Query":
-        if (selectedServer === "__query_all__") {
-          // Aggregate all tools and map to their MCPs
-          let allTools: Tool[] = []
-          const toolClientMap: Record<string, Client> = {}
-          for (const clientName of Object.keys(clients)) {
-            try {
-              const clientTools = (await clients[clientName].listTools()).tools
-              for (const tool of clientTools) {
-                allTools.push(tool)
-                toolClientMap[tool.name] = clients[clientName]
-              }
-            } catch {}
-          }
-          // Add chart tools to the aggregated tools
-          const chartToolsAsTools = Object.entries(chartTools).map(([name, tool]) => ({
-            name,
-            description: tool.description,
-            inputSchema: tool.parameters as any,
-            annotations: { title: name.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) }
-          }));
-          allTools.push(...chartToolsAsTools);
+        if (selectedServer === "All Servers") {
+          const { allTools, toolClientMap } = await aggregateToolsWithMapping(clients);
           await handleInteractiveQuery(allTools, { multi: true, toolClientMap })
         } else {
           if (!mcp) break;
@@ -401,7 +339,7 @@ async function handleInteractiveQuery(tools: Tool[], opts: { multi: boolean; too
 
   // Recursive function to process conversation steps
   async function processConversation(currentTranscript: string): Promise<void> {
-    const spinner = createSpinner('Generating response...');
+    const spinner = ora(chalk.yellow('Generating response...')).start();
 
     const { text, toolResults } = await generateText({ 
       model: google(GOOGLE_MODEL), 
@@ -421,11 +359,15 @@ async function handleInteractiveQuery(tools: Tool[], opts: { multi: boolean; too
     
     // Handle tool results and loop detection
     if (toolResults && toolResults.length > 0) {
-      console.log('toolResults :>> ', toolResults);
-      const calledToolNames = toolResults
-        .map(tr => tr.toolName)
-        .filter(Boolean);
-      console.log('Tools called:', calledToolNames);
+
+        const calledToolNames = toolResults
+          .map(tr => tr.toolName)
+          .filter(Boolean);
+
+    if (process.env.NODE_ENV === 'dev') {
+        console.log('toolResults :>> ', toolResults);
+        console.log('Tools called:', calledToolNames);
+    }
       
       // Check for repeated tool calls (loop detection)
       const currentToolCall = calledToolNames.join(',');
@@ -434,10 +376,12 @@ async function handleInteractiveQuery(tools: Tool[], opts: { multi: boolean; too
         if (consecutiveToolCalls >= MAX_CONSECUTIVE_TOOL_CALLS) {
           console.log(`⚠️  Detected ${consecutiveToolCalls} consecutive identical tool calls. Forcing final response...`);
           const output = toolResults[0]?.result?.content?.[0]?.text || JSON.stringify(toolResults);
+          const forceSpinner = ora(chalk.red('Forcing final response...')).start();
           const { text: forcedText } = await generateText({
             model: google(GOOGLE_MODEL),
             prompt: `${currentTranscript}\n\nTool Results: ${output}\n\nBased on the tool results above, provide a comprehensive final answer. Do not call any more tools.`,
           });
+          forceSpinner.stop();
           if (forcedText) {
             console.log(forcedText);
             console.log('--- End of conversation (loop prevented) ---');
@@ -454,11 +398,13 @@ async function handleInteractiveQuery(tools: Tool[], opts: { multi: boolean; too
     if (toolResults?.length && !text) {
       const output = toolResults[0]?.result?.content?.[0]?.text || JSON.stringify(toolResults);
       
+      const resultSpinner = ora(chalk.blue('Processing tool results...')).start();
       const { text: finalText } = await generateText({
         model: google(GOOGLE_MODEL),
         prompt: MCP_RESULT_PROMPT({ query: currentTranscript, output }),
         tools: buildToolSet()
       });
+      resultSpinner.stop();
       
       if (finalText) {
         console.log(finalText);
