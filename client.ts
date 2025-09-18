@@ -10,9 +10,11 @@ import {
   PromptMessage,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js"
-import { generateText, jsonSchema, ToolSet } from "ai"
+import { generateText, jsonSchema, ToolSet, tool } from "ai"
 
-import { MCP_RESULT_PROMPT } from "./constants"
+import { GOOGLE_MODEL, MCP_RESULT_PROMPT } from "./constants.js"
+import {createSpinner} from "./helper.js"
+import { chartTools } from "./chart-tools.js"
 
 const serverConfigs = [
   {
@@ -28,7 +30,7 @@ const serverConfigs = [
     name: "Alphavantage",
     url: `https://mcp.alphavantage.co/mcp?apikey=${process.env.ALPHAVANTAGE_API_KEY}`,
     type: "http",
-  }
+  },
 ]
 
 const clients: Record<string, Client> = {}
@@ -98,6 +100,16 @@ async function main() {
           allTools = allTools.concat(clientTools)
         } catch {}
       }
+
+      // Add chart tools to the tools array so they're available regardless of server selection
+      const chartToolsAsTools = Object.entries(chartTools).map(([name, tool]) => ({
+        name,
+        description: tool.description,
+        inputSchema: tool.parameters as any,
+        annotations: { title: name.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) }
+      }));
+      allTools.push(...chartToolsAsTools);
+
       tools = allTools
     } else {
       try {
@@ -147,8 +159,6 @@ async function main() {
       choices: menuChoices,
     })
 
-
-
   switch (option) {
       case "Switch Server":
         selectedServer = await select({
@@ -171,7 +181,7 @@ async function main() {
               }
             } catch {}
           }
-          await handleQueryAllServers(allTools, toolClientMap)
+          await handleInteractiveQuery(allTools, { multi: true, toolClientMap })
         } else {
           mcp = clients[selectedServer]
           await refreshServerData()
@@ -252,117 +262,20 @@ async function main() {
               }
             } catch {}
           }
-          await handleQueryAllServers(allTools, toolClientMap)
+          // Add chart tools to the aggregated tools
+          const chartToolsAsTools = Object.entries(chartTools).map(([name, tool]) => ({
+            name,
+            description: tool.description,
+            inputSchema: tool.parameters as any,
+            annotations: { title: name.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()) }
+          }));
+          allTools.push(...chartToolsAsTools);
+          await handleInteractiveQuery(allTools, { multi: true, toolClientMap })
         } else {
           if (!mcp) break;
-          console.log('tools :>> ', tools);
-          await handleQuery(tools, mcp)
+          await handleInteractiveQuery(tools, { multi: false, mcp })
         }
     }
-  }
-}
-
-// Query All Servers handler: uses correct client for each tool
-async function handleQueryAllServers(tools: Tool[], toolClientMap: Record<string, Client>) {
-  const query = await input({ message: "Enter your query" })
-
-  const { text, toolResults } = await generateText({
-    model: google("gemini-2.0-flash"),
-    prompt: query,
-    tools: tools.reduce(
-      (obj, tool) => ({
-        ...obj,
-        [tool.name]: {
-          description: tool.description,
-          parameters: jsonSchema(tool.inputSchema as any),
-          execute: async (args: Record<string, any>) => {
-            const mcp = toolClientMap[tool.name]
-            return await mcp.callTool({
-              name: tool.name,
-              arguments: args,
-            })
-          },
-        },
-      }),
-      {} as ToolSet
-    ),
-  }) as {
-    text: string;
-    toolResults?: Array<{
-      result?: {
-        content?: Array<{ text?: string }>;
-      };
-    }>;
-  }
-
-  // If Gemini already gave a full response, just print it
-  if (text) {
-    console.log(text)
-    return
-  }
-
-  // Otherwise, if toolResults exist, feed them back into Gemini
-  if (toolResults?.length) {
-    const output =
-      toolResults[0]?.result?.content?.[0]?.text || JSON.stringify(toolResults)
-
-    const { text: finalText } = await generateText({
-      model: google("gemini-2.0-flash"),
-      prompt: MCP_RESULT_PROMPT({ query, output }),
-    })
-
-    console.log(finalText || "No final text generated.")
-  }
-}
-
-async function handleQuery(tools: Tool[], mcp: Client) {
-  const query = await input({ message: "Enter your query" })
-
-  const { text, toolResults } = await generateText({
-    model: google("gemini-2.0-flash"),
-    prompt: query,
-    tools: tools.reduce(
-      (obj, tool) => ({
-        ...obj,
-        [tool.name]: {
-          description: tool.description,
-          parameters: jsonSchema(tool.inputSchema as any),
-          execute: async (args: Record<string, any>) => {
-            return await mcp.callTool({
-              name: tool.name,
-              arguments: args,
-            })
-          },
-        },
-      }),
-      {} as ToolSet
-    ),
-  }) as {
-    text: string;
-    toolResults?: Array<{
-      result?: {
-        content?: Array<{ text?: string }>;
-      };
-    }>;
-  }
-
-  // If Gemini already gave a full response, just print it
-  if (text) {
-    console.log(text)
-    return
-  }
-
-  // Otherwise, if toolResults exist, feed them back into Gemini
-  if (toolResults?.length) {
-    const output =
-      toolResults[0]?.result?.content?.[0]?.text || JSON.stringify(toolResults)
-
-    const { text: finalText } = await generateText({
-      model: google("gemini-2.0-flash"),
-      prompt: MCP_RESULT_PROMPT({ query, output}),
-    })
-
-    console.log(finalText || "No final text generated.")
   }
 }
 
@@ -437,11 +350,178 @@ async function handleServerMessagePrompt(message: PromptMessage) {
   if (!run) return
 
   const { text } = await generateText({
-    model: google("gemini-2.0-flash"),
+    model: google(GOOGLE_MODEL),
     prompt: message.content.text,
   })
 
   return text
+}
+
+// Unified interactive query loop (multi or single server). Uses recursive approach for conversation flow.
+async function handleInteractiveQuery(tools: Tool[], opts: { multi: boolean; toolClientMap?: Record<string, Client>; mcp?: Client }) {
+  const { multi, toolClientMap, mcp } = opts;
+  let userQuery = await input({ message: 'Enter your query' });
+  let transcript = `User: ${userQuery}`;
+  const clarificationRegex = /([?]\s*$)|(specify|clarify|which|provide more details|what (?:interval|format)|please choose|could you (?:specify|clarify|provide)|need more information|please provide|I also need)/i;
+  const isClarification = (t: string) => clarificationRegex.test(t.trim());
+  const isTooShort = (t: string) => t.split(/\s+/).length < 12;
+
+  // Loop detection to prevent infinite tool calls
+  let consecutiveToolCalls = 0;
+  let lastToolCall = '';
+  const MAX_CONSECUTIVE_TOOL_CALLS = 3;
+
+  const buildToolSet = (): ToolSet => {
+    const mcpTools: ToolSet = {};
+    
+    for (const toolDef of tools) {
+      if (toolDef.name in chartTools) {
+        // Handle chart tools
+        const chartTool = (chartTools as any)[toolDef.name];
+        mcpTools[toolDef.name] = tool({
+          description: chartTool.description,
+          parameters: chartTool.parameters,
+          execute: chartTool.execute,
+        });
+      } else {
+        // Handle MCP tools
+        mcpTools[toolDef.name] = tool({
+          description: toolDef.description,
+          parameters: jsonSchema(toolDef.inputSchema as any),
+          execute: async (args: any) => {
+            const execClient = multi ? toolClientMap![toolDef.name] : mcp!;
+            return await execClient.callTool({ name: toolDef.name, arguments: args });
+          },
+        });
+      }
+    }
+    
+    return mcpTools;
+  };
+
+  // Recursive function to process conversation steps
+  async function processConversation(currentTranscript: string): Promise<void> {
+    const spinner = createSpinner('Generating response...');
+
+    const { text, toolResults } = await generateText({ 
+      model: google(GOOGLE_MODEL), 
+      prompt: currentTranscript, 
+      tools: buildToolSet() 
+    }) as { 
+      text: string; 
+      toolResults?: Array<{
+        toolName?: string;
+        result?: {
+          content?: Array<{ text?: string }>;
+        };
+      }>;
+    };
+    
+    spinner.stop();
+    
+    // Handle tool results and loop detection
+    if (toolResults && toolResults.length > 0) {
+      console.log('toolResults :>> ', toolResults);
+      const calledToolNames = toolResults
+        .map(tr => tr.toolName)
+        .filter(Boolean);
+      console.log('Tools called:', calledToolNames);
+      
+      // Check for repeated tool calls (loop detection)
+      const currentToolCall = calledToolNames.join(',');
+      if (currentToolCall === lastToolCall) {
+        consecutiveToolCalls++;
+        if (consecutiveToolCalls >= MAX_CONSECUTIVE_TOOL_CALLS) {
+          console.log(`⚠️  Detected ${consecutiveToolCalls} consecutive identical tool calls. Forcing final response...`);
+          const output = toolResults[0]?.result?.content?.[0]?.text || JSON.stringify(toolResults);
+          const { text: forcedText } = await generateText({
+            model: google(GOOGLE_MODEL),
+            prompt: `${currentTranscript}\n\nTool Results: ${output}\n\nBased on the tool results above, provide a comprehensive final answer. Do not call any more tools.`,
+          });
+          if (forcedText) {
+            console.log(forcedText);
+            console.log('--- End of conversation (loop prevented) ---');
+            return;
+          }
+        }
+      } else {
+        consecutiveToolCalls = 0;
+        lastToolCall = currentToolCall;
+      }
+    }
+    
+    // If we have tool results but no text, feed results back to Gemini
+    if (toolResults?.length && !text) {
+      const output = toolResults[0]?.result?.content?.[0]?.text || JSON.stringify(toolResults);
+      
+      const { text: finalText } = await generateText({
+        model: google(GOOGLE_MODEL),
+        prompt: MCP_RESULT_PROMPT({ query: currentTranscript, output }),
+        tools: buildToolSet()
+      });
+      
+      if (finalText) {
+        console.log(finalText);
+        const newTranscript = currentTranscript + `\nAssistant: ${finalText}`;
+        
+        // Check if this final response is a clarification
+        if (isClarification(finalText.trim())) {
+          const answer = await input({ message: finalText.trim() + ' (/stop to cancel, /run to force answer)' });
+          if (answer.toLowerCase() === '/stop') { 
+            console.log('--- Conversation aborted ---'); 
+            return; 
+          }
+          const updatedTranscript = newTranscript + `\nUser: ${answer}`;
+          if (answer.toLowerCase() === '/run') {
+            return processConversation(updatedTranscript + '\nAssistant: Provide the best possible final answer now.');
+          }
+          return processConversation(updatedTranscript);
+        }
+        
+        // Check if response is too short
+        if (isTooShort(finalText.trim())) {
+          return processConversation(newTranscript + '\nUser: (auto) Please elaborate fully with data, context, and actionable insights.');
+        }
+        
+        console.log('--- End of conversation ---');
+        return;
+      }
+    }
+    
+    // Handle case where there's no text at all
+    if (!text) {
+      return processConversation(currentTranscript + '\nAssistant: Please provide the final comprehensive answer now.');
+    }
+    
+    // Handle normal text response
+    const reply = text.trim();
+    console.log(reply);
+    
+    if (isClarification(reply)) {
+      const answer = await input({ message: reply + ' (/stop to cancel, /run to force answer)' });
+      if (answer.toLowerCase() === '/stop') { 
+        console.log('--- Conversation aborted ---'); 
+        return; 
+      }
+      const newTranscript = currentTranscript + `\nAssistant: ${reply}\nUser: ${answer}`;
+      if (answer.toLowerCase() === '/run') {
+        return processConversation(newTranscript + '\nAssistant: Provide the best possible final answer now.');
+      }
+      return processConversation(newTranscript);
+    }
+    
+    // Non-clarification -> decide if we should force elaboration
+    if (isTooShort(reply)) {
+      const newTranscript = currentTranscript + `\nAssistant: ${reply}` + '\nUser: (auto) Please elaborate fully with data, context, and actionable insights.';
+      return processConversation(newTranscript);
+    }
+    
+    console.log('--- End of conversation ---');
+    return;
+  }
+
+  // Start the recursive conversation
+  await processConversation(transcript);
 }
 
 main()

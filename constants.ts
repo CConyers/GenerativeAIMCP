@@ -6,3 +6,4 @@ export const MCP_RESULT_PROMPT = ({ query, output }) => `
 
         Please format the final response according to the user’s request.
       `;
+export const GOOGLE_MODEL = "gemini-2.5-flash";
