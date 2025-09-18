@@ -57,7 +57,7 @@ How do we include real-time web searching and generative AI-based responses to p
 ### Examples
 
 - **"What was the latest earnings call information for customer X?"**
-- **"What are the latest industry trends that impact cloud usage and adoption in industry Y?"**IMCP
+- **"What are the latest industry trends that impact cloud usage and adoption in industry Y?"**
 
 > Real-time web search using generative AI responses
 
