@@ -1,4 +1,4 @@
-# Ge## 🎯 P# GenerativeAIMCP
+# GenerativeAIMCP
 
 > Real-time web search using generative AI responses
 
