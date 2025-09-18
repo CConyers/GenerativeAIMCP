@@ -10,23 +10,17 @@ import {
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import { generateText, jsonSchema, ToolSet } from 'ai';
-import chalk from 'chalk';
-import ora from 'ora';
+import chalk from 'chalk'; // Import chalk for colored output
+import ora from 'ora'; // Import ora for a loading spinner
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { MCP_RESULT_PROMPT } from './constants';
-
-import fs from 'node:fs/promises';
-import path from 'node:path';
-import { marked } from 'marked';
-import HTMLtoDOCX from 'html-to-docx';
 
 /**
  * MCP-powered Web Research + AI synthesis CLI
  * - Connects to Brave Search MCP server (real-time web)
  * - Normalizes results (JSON, code fences, markdown links, bare URLs)
  * - Synthesizes an answer with inline numeric citations [1][2]
- * - Detail level selector (Concise / Detailed / Deep-dive) & richer structure
- * - NEW: Exports Research result to Word (.docx) with clean formatting
+ * - NEW: Detail level selector (Concise / Detailed / Deep-dive) & richer structure
  */
 
 const serverConfigs = [
@@ -37,133 +31,21 @@ const serverConfigs = [
     env: {
       BRAVE_API_KEY: process.env.BRAVE_API_KEY || '',
     },
-    type: 'stdio' as const,
+    type: "stdio",
   },
   {
-    name: 'Alphavantage',
+    name: "Alphavantage",
     url: `https://mcp.alphavantage.co/mcp?apikey=${process.env.ALPHAVANTAGE_API_KEY}`,
-    type: 'http' as const,
-  },
+    type: "http",
+  }
 ];
 
 const clients: Record<string, Client> = {};
-const transports: Record<
-  string,
-  StdioClientTransport | StreamableHTTPClientTransport
-> = {};
+const transports: Record<string, StdioClientTransport | StreamableHTTPClientTransport> = {};
 
 const google = createGoogleGenerativeAI({
   apiKey: process.env.GEMINI_API_KEY,
 });
-
-/** ---------- Helpers for DOCX Export ---------- */
-
-function slugify(input: string) {
-  return input
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 80);
-}
-
-function formatLondonDate(d = new Date()) {
-  return new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Europe/London',
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-  }).format(d);
-}
-
-/**
- * Creates a polished DOCX from Markdown + metadata.
- * - Adds a cover header, query, date, and a Sources section
- * - Preserves headings, lists, tables, code blocks from Markdown
- */
-async function saveResearchAsDocx({
-  query,
-  markdown,
-  sourcesBlock,
-  outDir = process.cwd(),
-}: {
-  query: string;
-  markdown: string;
-  sourcesBlock: string;
-  outDir?: string;
-}) {
-  // Convert the markdown body to HTML
-  const htmlBody = marked.parse(markdown) as string;
-
-  // Turn the plain sources block into simple HTML paragraphs
-  const sourcesHtml = sourcesBlock
-    .split('\n\n')
-    .map(chunk => {
-      const safe = chunk
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-      // Make bare URLs clickable
-      const linked = safe.replace(
-        /(https?:\/\/[^\s)]+)/g,
-        '<a href="$1">$1</a>'
-      );
-      return `<p>${linked}</p>`;
-    })
-    .join('\n');
-
-  // Minimal, readable HTML scaffold for Word
-  const html = `
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>${query}</title>
-  <style>
-    body { font-family: "Segoe UI", Arial, sans-serif; line-height: 1.45; }
-    header.cover { text-align: left; margin-bottom: 24px; }
-    .muted { color: #666; }
-    h1, h2, h3 { margin: 18px 0 8px; }
-    p, li { margin: 8px 0; }
-    code { font-family: Consolas, "Courier New", monospace; }
-    pre code { white-space: pre-wrap; word-wrap: break-word; }
-    table { border-collapse: collapse; margin: 12px 0; width: 100%; }
-    th, td { border: 1px solid #ccc; padding: 6px 8px; }
-    blockquote { margin: 10px 0; padding-left: 12px; border-left: 3px solid #ddd; color: #444; }
-    hr { border: none; border-top: 1px solid #ddd; margin: 24px 0; }
-    .sources h2 { margin-top: 28px; }
-    a { text-decoration: none; }
-  </style>
-</head>
-<body>
-  <header class="cover">
-    <h1>${query}</h1>
-    <div class="muted">Generated: ${formatLondonDate()}</div>
-  </header>
-
-  ${htmlBody}
-
-  <section class="sources">
-    <h2>Sources</h2>
-    ${sourcesHtml}
-  </section>
-</body>
-</html>
-  `;
-
-  // Convert HTML → DOCX
-  const buffer = await HTMLtoDOCX(html);
-
-  // Name the file with query + date
-  const fname = `research-${slugify(query)}-${new Date()
-    .toISOString()
-    .slice(0, 10)}.docx`;
-  const outPath = path.join(outDir, fname);
-
-  await fs.writeFile(outPath, buffer);
-  return outPath;
-}
-
-/** ---------- Main Program ---------- */
 
 async function main() {
   // Connect to all servers
@@ -175,23 +57,22 @@ async function main() {
       },
       { capabilities: { sampling: {} } }
     );
-
-    let transport:
-      | StdioClientTransport
-      | StreamableHTTPClientTransport
-      | undefined;
-    if (config.type === 'stdio') {
-      transport = new StdioClientTransport({
-        command: config.command ?? '',
-        args: config.args,
-        env: config.env,
-        stderr: 'ignore',
-      });
-    } else if (config.type === 'http') {
-      transport = new StreamableHTTPClientTransport(new URL(config.url!));
-    } else {
-      throw new Error(`Unknown transport type: ${config.type}`);
-    }
+    
+    let transport: StdioClientTransport | StreamableHTTPClientTransport | undefined
+        if (config.type === "stdio") {
+            transport = new StdioClientTransport({
+              command: config.command ?? "",
+              args: config.args,
+              env: config.env,
+              stderr: "ignore",
+            })
+        } else if (config.type === "http") {
+            transport = new StreamableHTTPClientTransport(
+              new URL(config.url!)
+            )
+        } else {
+            throw new Error(`Unknown transport type: ${config.type}`)
+        }
 
     await client.connect(transport);
     clients[config.name] = client;
@@ -206,7 +87,6 @@ async function main() {
       ...serverConfigs.map(cfg => ({ name: cfg.name, value: cfg.name })),
     ],
   });
-
   // Always set mcp to a valid client (default to first client if needed)
   let mcp: Client =
     selectedServer === '__query_all__'
@@ -219,23 +99,21 @@ async function main() {
   let resourceTemplates: any[] = [];
 
   async function refreshServerData() {
-    if (selectedServer === '__query_all__') {
-      // Aggregate all tools from all clients
-      let allTools: Tool[] = [];
-      for (const clientName of Object.keys(clients)) {
-        try {
-          const clientTools = (await clients[clientName].listTools()).tools;
-          allTools = allTools.concat(clientTools);
-        } catch {}
-      }
-      tools = allTools;
-    } else {
-      try {
-        tools = (await mcp.listTools()).tools;
-      } catch {
-        tools = [];
-      }
-    }
+    if (selectedServer === "__query_all__") {
+          // Aggregate all tools from all clients
+          let allTools: Tool[] = []
+          for (const clientName of Object.keys(clients)) {
+            try {
+              const clientTools = (await clients[clientName].listTools()).tools
+              allTools = allTools.concat(clientTools)
+            } catch {}
+          }
+          tools = allTools
+        } else {
+          try {
+            tools = (await mcp.listTools()).tools
+          } catch { tools = [] }
+        }
     try {
       prompts = (await mcp.listPrompts())?.prompts ?? [];
     } catch {
@@ -298,7 +176,7 @@ async function main() {
           ],
         });
         if (selectedServer === '__query_all__') {
-          // Aggregate all tools and map to their MCPs
+          // Aggregate all tools from all clients
           let allTools2: Tool[] = [];
           for (const clientName of Object.keys(clients)) {
             try {
@@ -314,7 +192,6 @@ async function main() {
           await refreshServerData();
         }
         break;
-
       case 'Tools':
         if (!mcp) break;
         const toolName = await select({
@@ -325,104 +202,90 @@ async function main() {
             description: tool.description,
           })),
         });
-        {
-          const tool = tools.find(t => t.name === toolName);
-          if (tool == null) {
-            console.error('Tool not found.');
-          } else {
-            await handleTool(tool, mcp);
-          }
+        const tool = tools.find(t => t.name === toolName);
+        if (tool == null) {
+          console.error('Tool not found.');
+        } else {
+          await handleTool(tool, mcp);
         }
         break;
-
       case 'Resources':
         if (!mcp) break;
-        {
-          const resourceUri = await select({
-            message: 'Select a resource',
-            choices: [
-              ...resources.map(resource => ({
-                name: resource.name,
-                value: resource.uri,
-                description: resource.description,
-              })),
-              ...resourceTemplates.map(template => ({
-                name: template.name,
-                value: template.uriTemplate,
-                description: template.description,
-              })),
-            ],
-          });
-          const uri =
-            resources.find(r => r.uri === resourceUri)?.uri ??
-            resourceTemplates.find(r => r.uriTemplate === resourceUri)
-              ?.uriTemplate;
-          if (uri == null) {
-            console.error('Resource not found.');
-          } else {
-            await handleResource(uri, mcp);
-          }
+        const resourceUri = await select({
+          message: 'Select a resource',
+          choices: [
+            ...resources.map(resource => ({
+              name: resource.name,
+              value: resource.uri,
+              description: resource.description,
+            })),
+            ...resourceTemplates.map(template => ({
+              name: template.name,
+              value: template.uriTemplate,
+              description: template.description,
+            })),
+          ],
+        });
+        const uri =
+          resources.find(r => r.uri === resourceUri)?.uri ??
+          resourceTemplates.find(r => r.uriTemplate === resourceUri)
+            ?.uriTemplate;
+        if (uri == null) {
+          console.error('Resource not found.');
+        } else {
+          await handleResource(uri, mcp);
         }
         break;
-
       case 'Prompts':
         if (!mcp) break;
-        {
-          const promptName = await select({
-            message: 'Select a prompt',
-            choices: prompts.map(prompt => ({
-              name: prompt.name,
-              value: prompt.name,
-              description: prompt.description,
-            })),
-          });
-          const prompt = prompts.find(p => p.name === promptName);
-          if (prompt == null) {
-            console.error('Prompt not found.');
-          } else {
-            await handlePrompt(prompt, mcp);
-          }
+        const promptName = await select({
+          message: 'Select a prompt',
+          choices: prompts.map(prompt => ({
+            name: prompt.name,
+            value: prompt.name,
+            description: prompt.description,
+          })),
+        });
+        const prompt = prompts.find(p => p.name === promptName);
+        if (prompt == null) {
+          console.error('Prompt not found.');
+        } else {
+          await handlePrompt(prompt, mcp);
         }
         break;
-
       case 'Research (Web + AI)':
         await handleResearch(mcp);
         break;
-
-      case 'Query':
-        if (selectedServer === '__query_all__') {
-          // Aggregate all tools and map to their MCPs
-          let allTools: Tool[] = [];
-          const toolClientMap: Record<string, Client> = {};
-          for (const clientName of Object.keys(clients)) {
+      case "Query":
+        if (selectedServer === "__query_all__") {
+        // Aggregate all tools and map to their MCPs
+        let allTools: Tool[] = []
+        const toolClientMap: Record<string, Client> = {}
+        for (const clientName of Object.keys(clients)) {
             try {
-              const clientTools = (await clients[clientName].listTools()).tools;
-              for (const tool of clientTools) {
-                allTools.push(tool);
-                toolClientMap[tool.name] = clients[clientName];
-              }
+            const clientTools = (await clients[clientName].listTools()).tools
+            for (const tool of clientTools) {
+                allTools.push(tool)
+                toolClientMap[tool.name] = clients[clientName]
+            }
             } catch {}
-          }
-          await handleQueryAllServers(allTools, toolClientMap);
-        } else {
-          if (!mcp) break;
-          console.log('tools :>> ', tools);
-          await handleQuery(tools, mcp);
         }
-        break;
+        await handleQueryAllServers(allTools, toolClientMap)
+        } else {
+        if (!mcp) break;
+        console.log('tools :>> ', tools);
+        await handleQuery(tools, mcp)
+        }
     }
   }
 }
 
 // Query All Servers handler: uses correct client for each tool
-async function handleQueryAllServers(
-  tools: Tool[],
-  toolClientMap: Record<string, Client>
-) {
-  const query = await input({ message: 'Enter your query' });
+async function handleQueryAllServers(tools: Tool[], toolClientMap: Record<string, Client>) {
+  const query = await input({ message: "Enter your query" })
 
-  const { text, toolResults } = (await generateText({
-    model: google('gemini-2.0-flash'),
+  const { text, toolResults } = await generateText({
+    model: google("gemini-2.0-flash"),
     prompt: query,
     tools: tools.reduce(
       (obj, tool) => ({
@@ -431,42 +294,42 @@ async function handleQueryAllServers(
           description: tool.description,
           parameters: jsonSchema(tool.inputSchema as any),
           execute: async (args: Record<string, any>) => {
-            const mcp = toolClientMap[tool.name];
+            const mcp = toolClientMap[tool.name]
             return await mcp.callTool({
               name: tool.name,
               arguments: args,
-            });
+            })
           },
         },
       }),
       {} as ToolSet
     ),
-  })) as {
+  }) as {
     text: string;
     toolResults?: Array<{
       result?: {
         content?: Array<{ text?: string }>;
       };
     }>;
-  };
+  }
 
   // If Gemini already gave a full response, just print it
   if (text) {
-    console.log(text);
-    return;
+    console.log(text)
+    return
   }
 
   // Otherwise, if toolResults exist, feed them back into Gemini
   if (toolResults?.length) {
     const output =
-      toolResults[0]?.result?.content?.[0]?.text || JSON.stringify(toolResults);
+      toolResults[0]?.result?.content?.[0]?.text || JSON.stringify(toolResults)
 
     const { text: finalText } = await generateText({
-      model: google('gemini-2.0-flash'),
+      model: google("gemini-2.0-flash"),
       prompt: MCP_RESULT_PROMPT({ query, output }),
-    });
+    })
 
-    console.log(finalText || 'No final text generated.');
+    console.log(finalText || "No final text generated.")
   }
 }
 
@@ -855,8 +718,7 @@ async function handleResearch(mcp: Client) {
   const generationSpinner = ora(chalk.yellow('Synthesizing answer...')).start();
   const { text } = await generateText({
     model: google('gemini-2.0-flash'),
-    prompt: `SYSTEM:
-${system}
+    prompt: `SYSTEM:\n${system}
 
 USER QUERY:
 ${query}
@@ -866,29 +728,12 @@ ${sourcesBlock}
 
 Respond in Markdown and aim for about ${targetWords} words.`,
   });
+
   generationSpinner.succeed(chalk.green('Answer generated.'));
 
   console.log(chalk.green('\n===== Research Answer =====\n'));
   console.log(text || chalk.red('No answer generated.'));
   console.log(chalk.green('\n===== End =====\n'));
-
-  // NEW: Save to Word (.docx)
-  try {
-    if (text) {
-      const outPath = await saveResearchAsDocx({
-        query,
-        markdown: text,
-        sourcesBlock,
-      });
-      console.log(chalk.green(`\n📄 Word document saved: ${outPath}\n`));
-    } else {
-      console.log(chalk.yellow('Skipped DOCX export (no text).'));
-    }
-  } catch (err) {
-    console.error(chalk.red('Failed to create DOCX:'), err);
-  }
 }
 
 main();
-
-/** ---------- (End of file) ---------- */
