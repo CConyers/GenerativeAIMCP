@@ -1,6 +1,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { Tool } from "@modelcontextprotocol/sdk/types.js"
 import { chartTools } from "./chart-tools.js"
+import { jsonSchema, tool } from "ai";
 
 // Helper function to convert chart tools to Tool format
 export function getChartToolsAsTools(): Tool[] {
@@ -48,3 +49,30 @@ export async function aggregateToolsWithMapping(clients: Record<string, Client>)
   
   return { allTools, toolClientMap };
 }
+export const buildToolSet = ({ tools, multi, toolClientMap, mcp }: { tools: Tool[], multi?: boolean, toolClientMap?: Record<string, Client>, mcp?: Client }): ToolSet => {
+    const mcpTools: ToolSet = {};
+    
+    for (const toolDef of tools) {
+      if (toolDef.name in chartTools) {
+        // Handle chart tools
+        const chartTool = (chartTools as any)[toolDef.name];
+        mcpTools[toolDef.name] = tool({
+          description: chartTool.description,
+          parameters: chartTool.parameters,
+          execute: chartTool.execute,
+        });
+      } else {
+        // Handle MCP tools
+        mcpTools[toolDef.name] = tool({
+          description: toolDef.description,
+          parameters: jsonSchema(toolDef.inputSchema as any),
+          execute: async (args: any) => {
+            const execClient = multi ? toolClientMap![toolDef.name] : mcp!;
+            return await execClient.callTool({ name: toolDef.name, arguments: args });
+          },
+        });
+      }
+    }
+    
+    return mcpTools;
+  };
