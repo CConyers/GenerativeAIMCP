@@ -32,10 +32,6 @@
     "tsx": "^4.20.5",
     "typescript": "^5.9.2"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://CConyers: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@github.com/CConyers/GenerativeAIMCP.git"
-  },
   "author": "",
   "license": "ISC",
   "bugs": {

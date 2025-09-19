@@ -10,13 +10,12 @@ import {
   PromptMessage,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js"
-import { generateText, jsonSchema, ToolSet, tool } from "ai"
+import { generateText, ToolSet } from "ai"
 import ora from "ora"
 import chalk from "chalk"
 
 import { GOOGLE_MODEL, MCP_RESULT_PROMPT, SERVER_CONFIGS } from "./constants.js"
-import { chartTools } from "./chart-tools.js"
-import { aggregateAllTools, aggregateToolsWithMapping } from "./helpers.js"
+import { aggregateAllTools, aggregateToolsWithMapping, buildToolSet } from "./helpers.js"
 
 const clients: Record<string, Client> = {}
 const transports: Record<string, StdioClientTransport | StreamableHTTPClientTransport> = {}
@@ -104,7 +103,7 @@ async function main() {
 
     return {
       role: "user",
-      model: "gemini-2.0-flash",
+      model: GOOGLE_MODEL,
       stopReason: "endTurn",
       content: {
         type: "text",
@@ -297,7 +296,7 @@ async function handleServerMessagePrompt(message: PromptMessage) {
 
 // Unified interactive query loop (multi or single server). Uses recursive approach for conversation flow.
 async function handleInteractiveQuery(tools: Tool[], opts: { multi: boolean; toolClientMap?: Record<string, Client>; mcp?: Client }) {
-  const { multi, toolClientMap, mcp } = opts;
+
   let userQuery = await input({ message: 'Enter your query' });
   let transcript = `User: ${userQuery}`;
   const clarificationRegex = /([?]\s*$)|(specify|clarify|which|provide more details|what (?:interval|format)|please choose|could you (?:specify|clarify|provide)|need more information|please provide|I also need)/i;
@@ -309,52 +308,42 @@ async function handleInteractiveQuery(tools: Tool[], opts: { multi: boolean; too
   let lastToolCall = '';
   const MAX_CONSECUTIVE_TOOL_CALLS = 3;
 
-  const buildToolSet = (): ToolSet => {
-    const mcpTools: ToolSet = {};
-    
-    for (const toolDef of tools) {
-      if (toolDef.name in chartTools) {
-        // Handle chart tools
-        const chartTool = (chartTools as any)[toolDef.name];
-        mcpTools[toolDef.name] = tool({
-          description: chartTool.description,
-          parameters: chartTool.parameters,
-          execute: chartTool.execute,
-        });
-      } else {
-        // Handle MCP tools
-        mcpTools[toolDef.name] = tool({
-          description: toolDef.description,
-          parameters: jsonSchema(toolDef.inputSchema as any),
-          execute: async (args: any) => {
-            const execClient = multi ? toolClientMap![toolDef.name] : mcp!;
-            return await execClient.callTool({ name: toolDef.name, arguments: args });
-          },
-        });
-      }
-    }
-    
-    return mcpTools;
-  };
+  // Build toolset
+  const toolSet: ToolSet = buildToolSet({ tools, ...opts });
 
   // Recursive function to process conversation steps
-  async function processConversation(currentTranscript: string): Promise<void> {
+  async function processConversation(currentTranscript: string, toolSet: ToolSet): Promise<void> {
     const spinner = ora(chalk.yellow('Generating response...')).start();
 
-    const { text, toolResults } = await generateText({ 
-      model: google(GOOGLE_MODEL), 
-      prompt: currentTranscript, 
-      tools: buildToolSet() 
-    }) as { 
-      text: string; 
-      toolResults?: Array<{
-        toolName?: string;
-        result?: {
-          content?: Array<{ text?: string }>;
-        };
-      }>;
-    };
-    
+    const MAX_ATTEMPTS = 3;
+    let attempt = 0;
+    let text: string = '';
+    let toolResults: Array<{ toolName?: string; result?: { content?: Array<{ text?: string }> } }> | undefined;
+    while (attempt < MAX_ATTEMPTS) {
+      try {
+        const result = await generateText({
+          model: google(GOOGLE_MODEL),
+          prompt: currentTranscript,
+          tools: toolSet
+        }) as any;
+        text = result.text;
+        toolResults = result.toolResults;
+        break;
+      } catch (err: any) {
+        attempt++;
+        const isOverload = /overloaded|UNAVAILABLE|503/i.test(err?.message || '') || err?.statusCode === 503 || err?.reason === 'maxRetriesExceeded';
+        if (!isOverload || attempt >= MAX_ATTEMPTS) {
+          spinner.stop();
+            console.error(chalk.red(`Model error (attempt ${attempt}): ${err?.message || err}`));
+            console.log('--- Conversation aborted due to model failure ---');
+            return;
+        }
+        const backoff = 600 * attempt; // incremental backoff
+        spinner.text = `Model overloaded, retrying in ${backoff}ms (attempt ${attempt}/${MAX_ATTEMPTS})...`;
+        await new Promise(r => setTimeout(r, backoff));
+      }
+    }
+
     spinner.stop();
     
     // Handle tool results and loop detection
@@ -394,6 +383,17 @@ async function handleInteractiveQuery(tools: Tool[], opts: { multi: boolean; too
       }
     }
     
+    // Fast-path: if user only wanted a chart/visualization and a tool already produced a URL, end early.
+    const visualizationOnlyQuery = /\b(chart|graph|plot|visual)\b/i.test(userQuery) && !/\b(stock|price|search|lookup|symbol|data-finance)\b/i.test(userQuery);
+    if (visualizationOnlyQuery && toolResults?.length) {
+      const firstOut = toolResults[0]?.result?.content?.[0]?.text || '';
+      if (/https?:\/\//.test(firstOut)) {
+        console.log('--- Visualization complete (fast-path) ---');
+        console.log(firstOut);
+        return;
+      }
+    }
+
     // If we have tool results but no text, feed results back to Gemini
     if (toolResults?.length && !text) {
       const output = toolResults[0]?.result?.content?.[0]?.text || JSON.stringify(toolResults);
@@ -402,7 +402,7 @@ async function handleInteractiveQuery(tools: Tool[], opts: { multi: boolean; too
       const { text: finalText } = await generateText({
         model: google(GOOGLE_MODEL),
         prompt: MCP_RESULT_PROMPT({ query: currentTranscript, output }),
-        tools: buildToolSet()
+        tools: toolSet
       });
       resultSpinner.stop();
       
@@ -419,14 +419,14 @@ async function handleInteractiveQuery(tools: Tool[], opts: { multi: boolean; too
           }
           const updatedTranscript = newTranscript + `\nUser: ${answer}`;
           if (answer.toLowerCase() === '/run') {
-            return processConversation(updatedTranscript + '\nAssistant: Provide the best possible final answer now.');
+            return processConversation(updatedTranscript + '\nAssistant: Provide the best possible final answer now.', toolSet);
           }
-          return processConversation(updatedTranscript);
+          return processConversation(updatedTranscript, toolSet);
         }
         
         // Check if response is too short
         if (isTooShort(finalText.trim())) {
-          return processConversation(newTranscript + '\nUser: (auto) Please elaborate fully with data, context, and actionable insights.');
+          return processConversation(newTranscript + '\nUser: (auto) Please elaborate fully with data, context, and actionable insights.', toolSet);
         }
         
         console.log('--- End of conversation ---');
@@ -436,7 +436,7 @@ async function handleInteractiveQuery(tools: Tool[], opts: { multi: boolean; too
     
     // Handle case where there's no text at all
     if (!text) {
-      return processConversation(currentTranscript + '\nAssistant: Please provide the final comprehensive answer now.');
+      return processConversation(currentTranscript + '\nAssistant: Please provide the final comprehensive answer now.', toolSet);
     }
     
     // Handle normal text response
@@ -451,15 +451,15 @@ async function handleInteractiveQuery(tools: Tool[], opts: { multi: boolean; too
       }
       const newTranscript = currentTranscript + `\nAssistant: ${reply}\nUser: ${answer}`;
       if (answer.toLowerCase() === '/run') {
-        return processConversation(newTranscript + '\nAssistant: Provide the best possible final answer now.');
+        return processConversation(newTranscript + '\nAssistant: Provide the best possible final answer now.', toolSet);
       }
-      return processConversation(newTranscript);
+      return processConversation(newTranscript, toolSet);
     }
     
     // Non-clarification -> decide if we should force elaboration
     if (isTooShort(reply)) {
       const newTranscript = currentTranscript + `\nAssistant: ${reply}` + '\nUser: (auto) Please elaborate fully with data, context, and actionable insights.';
-      return processConversation(newTranscript);
+      return processConversation(newTranscript, toolSet);
     }
     
     console.log('--- End of conversation ---');
@@ -467,7 +467,7 @@ async function handleInteractiveQuery(tools: Tool[], opts: { multi: boolean; too
   }
 
   // Start the recursive conversation
-  await processConversation(transcript);
+  await processConversation(transcript, toolSet);
 }
 
 main()
